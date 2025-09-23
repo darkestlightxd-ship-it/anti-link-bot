@@ -1,72 +1,143 @@
+# anti_link_bot_mongo_full.py
+import os
 import re
 import time
 import asyncio
-import os
-import sys
-from dotenv import load_dotenv
+from typing import Optional, List
+
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.enums import ChatMemberStatus
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.exceptions import TelegramBadRequest
 
-# Load environment variables
-load_dotenv()
+from motor.motor_asyncio import AsyncIOMotorClient
 
-# ===== CONFIG =====
-API_TOKEN = os.getenv("BOT_TOKEN", "8470214636:AAExm5uh4tu621S5zvHDMDfWQzxruvgvuwY")
-BOT_OWNER_ID = 6156257558  # YOUR OWNER ID
-OWNER_USERNAME = "Insaanova"
-UPDATES_USERNAME = "FRIENDS_CORNER_CHATTING_GROUP"
+# === DIRECT CREDENTIALS (as requested) ===
+API_TOKEN = "8470214636:AAExm5uh4tu621S5zvHDMDfWQzxruvgvuwY"
+MONGO_URI = "mongodb+srv://darkestlightxd_db_user:dbuserinsaan085122@cluster0.cwamdsd.mongodb.net/anti_link_bot"
 LOG_CHAT_ID = -1003086724642
-BROADCAST_SOURCE_CHANNEL = -1002933746046  # APNA SOURCE CHANNEL ID
 
-# Dynamic buttons storage (in-memory)
-dynamic_buttons = [
-    {"text": "👑 Owner", "url": f"https://t.me/{OWNER_USERNAME}"},
-    {"text": "📢 Updates", "url": f"https://t.me/{UPDATES_USERNAME}"},
-    {"text": "❓ Help & Commands", "callback_data": "help"}
-]
-
-warnings = {}
-whitelist = set()
-approved_users = set()  # For approveme command
-group_settings = {}  # chat_id: settings
-mute_duration = 5  # minutes
-user_bio_cache = {}  # Cache user bios to avoid frequent API calls
-maintenance_active = False
-pending_broadcast = None
-
+# === Init bot/dispatcher ===
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher()
 
-# Owner check function
+# === MongoDB connection ===
+if not MONGO_URI:
+    raise RuntimeError("MONGO_URI not provided")
+
+mongo = AsyncIOMotorClient(MONGO_URI)
+# If your URI includes the DB name (it does: anti_link_bot), get_default_database() will return it.
+db = mongo.get_default_database()
+
+# Collections
+col_groups = db["group_settings"]
+col_whitelist = db["whitelist"]
+col_approved = db["approved_users"]
+col_warnings = db["warnings"]
+col_buttons = db["dynamic_buttons"]
+col_meta = db["meta"]
+
+# Defaults / Helpers ===
+DEFAULT_GROUP_SETTINGS = {"links": True, "biolinks": True, "username": True, "botlink": True}
+MUTE_DURATION_MIN = 5
+
+LINK_PATTERN = re.compile(r"(https?://|t\.me/|wa\.me|instagram\.com|youtube\.com|facebook\.com|twitter.com|whatsapp\.com|linkedin\.com|snapchat\.com|pinterest\.com|reddit\.com|tiktok\.com|discord\.gg|telegram\.me)", re.IGNORECASE)
+BOTNAME_PATTERN = re.compile(r"@[\w_]*bot", re.IGNORECASE)
+USERNAME_PATTERN = re.compile(r"@[\w_]+", re.IGNORECASE)
+
+BOT_OWNER_ID = 6156257558
+OWNER_USERNAME = "Insaanova"
+UPDATES_USERNAME = "FRIENDS_CORNER_CHATTING_GROUP"
+
 def is_owner(user_id: int) -> bool:
     return user_id == BOT_OWNER_ID
 
-# --- Helper Functions ---
-def get_group_settings(chat_id: int):
-    if chat_id not in group_settings:
-        group_settings[chat_id] = {"links": True, "biolinks": True, "username": True, "botlink": True}
-    return group_settings[chat_id]
+# --- DB accessors ---
+async def get_group_settings(chat_id: int) -> dict:
+    doc = await col_groups.find_one({"_id": chat_id})
+    if not doc:
+        doc = DEFAULT_GROUP_SETTINGS.copy()
+        doc["_id"] = chat_id
+        await col_groups.insert_one(doc)
+    return {k: doc.get(k, DEFAULT_GROUP_SETTINGS[k]) for k in DEFAULT_GROUP_SETTINGS}
 
-def has_links(text: str):
+async def set_group_setting(chat_id: int, key: str, value: bool):
+    await col_groups.update_one({"_id": chat_id}, {"$set": {key: value}}, upsert=True)
+
+async def is_whitelisted(user_id: int) -> bool:
+    doc = await col_whitelist.find_one({"_id": user_id})
+    return doc is not None
+
+async def whitelist_add(user_id: int, full_name: str = "", username: Optional[str] = None):
+    await col_whitelist.update_one({"_id": user_id}, {"$set": {"full_name": full_name, "username": username}}, upsert=True)
+
+async def whitelist_remove(user_id: int):
+    await col_whitelist.delete_one({"_id": user_id})
+
+async def get_whitelist_list(limit: int = 100) -> List[dict]:
+    docs = col_whitelist.find().limit(limit)
+    return [d async for d in docs]
+
+async def is_approved(user_id: int) -> bool:
+    doc = await col_approved.find_one({"_id": user_id})
+    return doc is not None
+
+async def approve_user(user_id: int):
+    await col_approved.update_one({"_id": user_id}, {"$set": {"approved": True}}, upsert=True)
+
+async def unapprove_user(user_id: int):
+    await col_approved.delete_one({"_id": user_id})
+
+async def get_warning_count(user_id: int) -> int:
+    doc = await col_warnings.find_one({"_id": user_id})
+    return doc.get("count", 0) if doc else 0
+
+async def inc_warning(user_id: int) -> int:
+    await col_warnings.update_one({"_id": user_id}, {"$inc": {"count": 1}}, upsert=True)
+    doc = await col_warnings.find_one({"_id": user_id})
+    return doc.get("count", 0)
+
+async def reset_warnings(user_id: int):
+    await col_warnings.delete_one({"_id": user_id})
+
+async def get_dynamic_buttons() -> List[dict]:
+    doc = await col_buttons.find_one({"_id": "buttons"})
+    if not doc:
+        default = [
+            {"text": "👑 Owner", "url": f"https://t.me/{OWNER_USERNAME}"},
+            {"text": "📢 Updates", "url": f"https://t.me/{UPDATES_USERNAME}"},
+            {"text": "❓ Help & Commands", "callback_data": "help"}
+        ]
+        await col_buttons.insert_one({"_id": "buttons", "buttons": default})
+        return default
+    return doc.get("buttons", [])
+
+async def set_dynamic_buttons(new_buttons: List[dict]):
+    await col_buttons.update_one({"_id": "buttons"}, {"$set": {"buttons": new_buttons}}, upsert=True)
+
+async def get_meta(key: str, default=None):
+    doc = await col_meta.find_one({"_id": key})
+    return doc.get("value") if doc else default
+
+async def set_meta(key: str, value):
+    await col_meta.update_one({"_id": key}, {"$set": {"value": value}}, upsert=True)
+
+# utility
+def has_links(text: str) -> bool:
     if not text:
         return False
-    pattern = r"(https?://|t\.me/|wa\.me|instagram\.com|youtube\.com|facebook\.com|twitter.com|whatsapp\.com|linkedin\.com|snapchat\.com|pinterest\.com|reddit\.com|tiktok\.com|discord\.gg|telegram\.me)"
-    return bool(re.search(pattern, text, re.IGNORECASE))
+    return bool(LINK_PATTERN.search(text))
 
-def has_bot_username(text: str):
+def has_bot_username(text: str) -> bool:
     if not text:
         return False
-    pattern = r"@[\w_]*bot"
-    return bool(re.search(pattern, text, re.IGNORECASE))
+    return bool(BOTNAME_PATTERN.search(text))
 
-def has_username(text: str):
+def has_username(text: str) -> bool:
     if not text:
         return False
-    pattern = r"@[\w_]+"
-    return bool(re.search(pattern, text, re.IGNORECASE))
+    return bool(USERNAME_PATTERN.search(text))
 
 async def auto_delete(msg: types.Message, delay: int = 5):
     try:
@@ -81,16 +152,11 @@ async def auto_delete(msg: types.Message, delay: int = 5):
     except Exception as e:
         print(f"Error in auto_delete: {e}")
 
-# Bio checking function with real-time checking (no cache)
-async def check_user_bio(user_id: int):
+async def check_user_bio(user_id: int) -> bool:
     try:
-        # Get fresh bio from Telegram with error handling
         user = await bot.get_chat(user_id)
-        bio = user.bio or ""
-        
-        # Check for any restricted content in real-time
+        bio = getattr(user, "bio", "") or ""
         return has_links(bio) or has_username(bio) or has_bot_username(bio)
-        
     except TelegramBadRequest as e:
         print(f"Bio check failed for user {user_id}: {e}")
         return False
@@ -98,206 +164,22 @@ async def check_user_bio(user_id: int):
         print(f"Unexpected error in bio check: {e}")
         return False
 
-# --- Admin Check Function ---
-async def is_admin(chat_id: int, user_id: int) -> bool:
-    try:
-        member = await bot.get_chat_member(chat_id, user_id)
-        return member.status in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR]
-    except TelegramBadRequest as e:
-        print(f"Admin check failed for user {user_id} in chat {chat_id}: {e}")
-        return False
-    except Exception as e:
-        print(f"Unexpected error in admin check: {e}")
-        return False
-
-# --- NEW FUNCTION: Admin message deletion without warning ---
-async def delete_admin_message(message: types.Message):
-    try:
-        await message.delete()
-    except TelegramBadRequest as e:
-        print(f"Delete failed: {e}")
-        return
-
-    # Send polite deletion notice for admins
-    deletion_msg = await message.answer(
-        f"🗑️ Admin @{message.from_user.username or message.from_user.first_name}, your link was deleted. Please approve yourself first using /approveme",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="👑 Owner", url=f"https://t.me/{OWNER_USERNAME}")],
-                [InlineKeyboardButton(text="📢 Updates", url=f"https://t.me/{UPDATES_USERNAME}")]
-            ]
-        )
-    )
-    asyncio.create_task(auto_delete(deletion_msg))
-
-# --- UPDATED: Custom Warning Function with Specific Messages ---
-async def warn_and_delete(message: types.Message, violation_type: str = "links"):
-    try:
-        # Check if user is admin first
-        is_user_admin = await is_admin(message.chat.id, message.from_user.id)
-        
-        if is_user_admin:
-            await delete_admin_message(message)
-            return
-            
-        if message.from_user.id in whitelist or message.from_user.id in approved_users:
-            return
-
-        user_id = message.from_user.id
-        warnings[user_id] = warnings.get(user_id, 0) + 1
-
-        try:
-            await message.delete()
-        except TelegramBadRequest as e:
-            print(f"Delete failed: {e}")
-            return  # Don't proceed if message deletion failed
-
-        # Custom warning messages based on violation type
-        if violation_type == "biolinks":
-            warning_text = f"👤 @{message.from_user.username or message.from_user.first_name} Your message was hidden. Bio links are not allowed in this group, please remove them."
-        elif violation_type == "links":
-            warning_text = f"👤 @{message.from_user.username or message.from_user.first_name} Your message was hidden. Links are not allowed in this group, please remove them."
-        elif violation_type == "username":
-            warning_text = f"👤 @{message.from_user.username or message.from_user.first_name} Your message was hidden. Usernames are not allowed in this group, please remove them."
-        elif violation_type == "botlink":
-            warning_text = f"👤 @{message.from_user.username or message.from_user.first_name} Your message was hidden. Bot usernames are not allowed in this group, please remove them."
-        else:
-            warning_text = f"⚠️ @{message.from_user.username or message.from_user.first_name} Warning {warnings[user_id]}/3 - Risky content not allowed!"
-
-        # REMOVED HELP BUTTON FROM WARNING MESSAGE
-        warning_msg = await message.answer(
-            warning_text,
-            reply_markup=InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [InlineKeyboardButton(text="👑 Owner", url=f"https://t.me/{OWNER_USERNAME}")],
-                    [InlineKeyboardButton(text="📢 Updates", url=f"https://t.me/{UPDATES_USERNAME}")]
-                ]
-            )
-        )
-
-        asyncio.create_task(auto_delete(warning_msg))
-
-        # Log the action with error handling
-        try:
-            await bot.send_message(
-                LOG_CHAT_ID,
-                f"⚠️ @{message.from_user.username or message.from_user.first_name} sent {violation_type} in {message.chat.title}"
-            )
-        except TelegramBadRequest as e:
-            print(f"Log failed: {e}")
-
-        if warnings[user_id] >= 3:
-            until_date = int(time.time()) + mute_duration * 60
-            try:
-                await bot.restrict_chat_member(
-                    message.chat.id,
-                    user_id,
-                    permissions=types.ChatPermissions(can_send_messages=False),
-                    until_date=until_date
-                )
-
-                mute_msg = await bot.send_message(
-                    message.chat.id,
-                    f"🔇 @{message.from_user.username or message.from_user.first_name} muted for {mute_duration} min.",
-                    reply_markup=InlineKeyboardMarkup(
-                        inline_keyboard=[
-                            [InlineKeyboardButton(text="Unmute", callback_data=f"unmute:{user_id}")]
-                        ]
-                    )
-                )
-                asyncio.create_task(auto_delete(mute_msg))
-
-                # reset warnings after mute
-                warnings[user_id] = 0
-
-                # Log the mute action
-                try:
-                    await bot.send_message(
-                        LOG_CHAT_ID,
-                        f"🔇 @{message.from_user.username or message.from_user.first_name} muted in {message.chat.title}"
-                    )
-                except TelegramBadRequest as e:
-                    print(f"Log failed: {e}")
-
-            except TelegramBadRequest as e:
-                error_msg = await message.reply("❌ I need admin permissions to mute users!")
-                asyncio.create_task(auto_delete(error_msg))
-                print(f"Mute failed: {e}")
-                
-    except Exception as e:
-        print(f"Error in warn_and_delete: {e}")
-
-# --- Updated PM Buttons Function ---
-async def get_personal_buttons():
+async def get_personal_buttons() -> InlineKeyboardMarkup:
     me = await bot.get_me()
-    
-    # Create keyboard from dynamic buttons
+    btns = await get_dynamic_buttons()
     keyboard = []
     current_row = []
-    
-    for i, btn in enumerate(dynamic_buttons):
+    for i, btn in enumerate(btns):
         if 'url' in btn:
             current_row.append(InlineKeyboardButton(text=btn['text'], url=btn['url']))
         else:
             current_row.append(InlineKeyboardButton(text=btn['text'], callback_data=btn['callback_data']))
-        
-        # Add row after every 2 buttons or at the end
-        if len(current_row) == 2 or i == len(dynamic_buttons) - 1:
+        if len(current_row) == 2 or i == len(btns) - 1:
             keyboard.append(current_row)
             current_row = []
-    
-    # Always add "Add to Group" button at the end
-    keyboard.append([InlineKeyboardButton(text="➕ Add me to your group", 
-                                        url=f"https://t.me/{me.username}?startgroup=true")])
-    
+    keyboard.append([InlineKeyboardButton(text="➕ Add me to your group", url=f"https://t.me/{me.username}?startgroup=true")])
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
-@dp.message(Command("start"))
-async def cmd_start(message: types.Message):
-    if message.chat.type == "private":
-        # Get user's first name
-        user_name = message.from_user.first_name
-        
-        # Your provided image URL
-        photo_url = "https://cftc-15g.pages.dev/1758448580525_file_1758448580525.jpg"
-        
-        try:
-            # Send message with photo
-            await bot.send_photo(
-                chat_id=message.chat.id,
-                photo=photo_url,
-                caption=f"Hey 👋🏻 {user_name}\n\n"
-                        "Welcome to Links Shield Bot\n\n"
-                        "I protect your group from:\n"
-                        "➤ All spam Links & URLs\n"
-                        "➤ Username (@example)\n"
-                        "➤ Bot Usernames (@bot)\n" 
-                        "➤ Bio Links also\n"
-                        "➤ Admin Links too\n\n"
-                        "Admins: Use /approveme to send links\n\n"
-                        "Add me to your group & make me admin!",
-                parse_mode="Markdown",
-                reply_markup=await get_personal_buttons()
-            )
-        except Exception as e:
-            # If photo fails, send simple message
-            print(f"Photo send failed: {e}")
-            await message.reply(
-                f"Hey 👋🏻 {user_name}\n\n"
-                "Welcome to Links Shield Bot\n"
-                "I protect your group from:\n"
-                "➤ All spam Links & URLs\n"
-                "➤ Username (@example)\n"
-                "➤ Bot Usernames (@bot)\n" 
-                "➤ Bio Links also\n"
-                "➤ Admin Links too\n\n"
-                "Admins: Use /approveme to send links\n\n"
-                "Add me to your group & make me admin!",
-                parse_mode="Markdown",
-                reply_markup=await get_personal_buttons()
-            )
-
-# --- FIXED HELP TEXTS ---
 BASIC_HELP_TEXT = """🤖 *Anti-Link Bot Help*
 
 I automatically detect and remove risky content including:
@@ -306,7 +188,6 @@ I automatically detect and remove risky content including:
 • Usernames with "bot"
 • Regular usernames (@username)
 • Bio links"""
-
 ADMIN_HELP_TEXT = """🔧 *Admin Commands:*
 • `/links on|off` - Toggle link detection
 • `/username on|off` - Toggle username detection  
@@ -316,7 +197,6 @@ ADMIN_HELP_TEXT = """🔧 *Admin Commands:*
 • `/whitelistremove` - Reply to remove from whitelist
 • `/whitelistshow` - Show whitelisted users
 • `/approveme` - Approve yourself to send links"""
-
 OWNER_HELP_TEXT = """👑 *Owner Commands:*
 • `/botstats` - Bot statistics
 • `/listgroups` - Groups list
@@ -328,41 +208,63 @@ OWNER_HELP_TEXT = """👑 *Owner Commands:*
 • `/setbuttons` - Change buttons
 • `/previewbuttons` - Preview buttons
 • `/resetbuttons` - Reset buttons"""
+help_keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Back", callback_data="back_to_main")],[InlineKeyboardButton(text="❌ Close", callback_data="close_help")]])
 
-# Help keyboard with close and back button
-help_keyboard = InlineKeyboardMarkup(
-    inline_keyboard=[
-        [InlineKeyboardButton(text="⬅️ Back", callback_data="back_to_main")],
-        [InlineKeyboardButton(text="❌ Close", callback_data="close_help")]
-    ]
-)
 
-# --- FIXED HELP COMMAND ---
+# === Handlers ===
+
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message):
+    if message.chat.type != "private":
+        return
+    user_name = message.from_user.first_name
+    photo_url = "https://cftc-15g.pages.dev/1758448580525_file_1758448580525.jpg"
+    try:
+        await bot.send_photo(
+            chat_id=message.chat.id,
+            photo=photo_url,
+            caption=f"Hey 👋🏻 {user_name}\n\n"
+                    "Welcome to Links Shield Bot\n\n"
+                    "I protect your group from:\n"
+                    "➤ All spam Links & URLs\n"
+                    "➤ Username (@example)\n"
+                    "➤ Bot Usernames (@bot)\n"
+                    "➤ Bio Links also\n"
+                    "➤ Admin Links too\n\n"
+                    "Admins: Use /approveme to send links\n\n"
+                    "Add me to your group & make me admin!",
+            parse_mode="Markdown",
+            reply_markup=await get_personal_buttons()
+        )
+    except Exception as e:
+        print(f"Photo send failed: {e}")
+        await message.reply(
+            f"Hey 👋🏻 {user_name}\n\n"
+            "Welcome to Links Shield Bot\n"
+            "I protect your group from spam & risky links.\n\n"
+            "Admins: Use /approveme to send links\n\n"
+            "Add me to your group & make me admin!",
+            parse_mode="Markdown",
+            reply_markup=await get_personal_buttons()
+        )
+
+
 @dp.message(Command("help"))
 async def cmd_help(message: types.Message):
-    # Personal chat
     if message.chat.type == "private":
         if is_owner(message.from_user.id):
-            # Show everything to owner with proper formatting
             help_text = f"{BASIC_HELP_TEXT}\n\n{ADMIN_HELP_TEXT}\n\n{OWNER_HELP_TEXT}"
         else:
-            # Show only basic + admin commands to normal users
             help_text = f"{BASIC_HELP_TEXT}\n\n{ADMIN_HELP_TEXT}"
-        
         await message.reply(help_text, reply_markup=help_keyboard, parse_mode="Markdown")
-    
-    # Group chat
     else:
         try:
             member = await bot.get_chat_member(message.chat.id, message.from_user.id)
             if member.status in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR]:
                 if is_owner(message.from_user.id):
-                    # Show everything to owner in group
                     help_text = f"{BASIC_HELP_TEXT}\n\n{ADMIN_HELP_TEXT}\n\n{OWNER_HELP_TEXT}"
                 else:
-                    # Show only basic + admin commands to admins in group
                     help_text = f"{BASIC_HELP_TEXT}\n\n{ADMIN_HELP_TEXT}"
-                
                 help_msg = await message.reply(help_text, parse_mode="Markdown")
                 await asyncio.sleep(10)
                 await help_msg.delete()
@@ -375,506 +277,393 @@ async def cmd_help(message: types.Message):
             await asyncio.sleep(5)
             await status_msg.delete()
 
-# --- Approveme Command ---
+
 @dp.message(Command("approveme"))
 async def approve_me(message: types.Message):
     if message.chat.type == "private":
         return
-        
     if not await is_admin(message.chat.id, message.from_user.id):
         status_msg = await message.reply("❌ Only admins can use this command!")
         asyncio.create_task(auto_delete(status_msg, 10))
         return
-    
-    user_id = message.from_user.id
-    approved_users.add(user_id)
-    
+    await approve_user(message.from_user.id)
     status_msg = await message.reply(
-        f"✅ @{message.from_user.username or message.from_user.first_name} approved!\n"
-        f"You can now send links in this group."
+        f"✅ @{message.from_user.username or message.from_user.first_name} approved!\nYou can now send links in this group."
     )
     asyncio.create_task(auto_delete(status_msg, 10))
 
-# --- Toggle Commands (Fixed for admins only) ---
+
+# --- admin check wrapper
+async def is_admin(chat_id: int, user_id: int) -> bool:
+    try:
+        member = await bot.get_chat_member(chat_id, user_id)
+        return member.status in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR]
+    except TelegramBadRequest as e:
+        print(f"Admin check failed for user {user_id} in chat {chat_id}: {e}")
+        return False
+    except Exception as e:
+        print(f"Unexpected error in admin check: {e}")
+        return False
+
+
+# Toggle commands
 @dp.message(Command("biolinks"))
 async def toggle_biolinks(message: types.Message):
     if message.chat.type == "private":
         return
-        
     if not await is_admin(message.chat.id, message.from_user.id):
         status_msg = await message.reply("❌ Only admins can use this command!")
         asyncio.create_task(auto_delete(status_msg, 10))
         return
-        
     args = message.text.split()
     if len(args) != 2 or args[1].lower() not in ["on", "off"]:
         status_msg = await message.reply("Usage: /biolinks on|off")
         asyncio.create_task(auto_delete(status_msg, 10))
         return
-        
-    settings = get_group_settings(message.chat.id)
-    settings["biolinks"] = args[1].lower() == "on"
-    
-    status_msg = await message.reply(f"Bio links deletion set to {'ON ✅' if settings['biolinks'] else 'OFF ❌'}")
+    await set_group_setting(message.chat.id, "biolinks", args[1].lower() == "on")
+    status_msg = await message.reply(f"Bio links deletion set to {'ON ✅' if args[1].lower() == 'on' else 'OFF ❌'}")
     asyncio.create_task(auto_delete(status_msg, 10))
 
 @dp.message(Command("links"))
 async def toggle_links(message: types.Message):
-    if message.chat.type == "private": 
+    if message.chat.type == "private":
         return
-        
     if not await is_admin(message.chat.id, message.from_user.id):
         status_msg = await message.reply("❌ Only admins can use this command!")
         asyncio.create_task(auto_delete(status_msg, 10))
         return
-        
     args = message.text.split()
     if len(args) != 2 or args[1].lower() not in ["on", "off"]:
         status_msg = await message.reply("Usage: /links on|off")
         asyncio.create_task(auto_delete(status_msg, 10))
         return
-        
-    settings = get_group_settings(message.chat.id)
-    settings["links"] = args[1].lower() == "on"
-    
-    status_msg = await message.reply(f"Links deletion set to {'ON ✅' if settings['links'] else 'OFF ❌'}")
+    await set_group_setting(message.chat.id, "links", args[1].lower() == "on")
+    status_msg = await message.reply(f"Links deletion set to {'ON ✅' if args[1].lower() == 'on' else 'OFF ❌'}")
     asyncio.create_task(auto_delete(status_msg, 10))
 
 @dp.message(Command("username"))
 async def toggle_username(message: types.Message):
-    if message.chat.type == "private": 
+    if message.chat.type == "private":
         return
-        
     if not await is_admin(message.chat.id, message.from_user.id):
         status_msg = await message.reply("❌ Only admins can use this command!")
         asyncio.create_task(auto_delete(status_msg, 10))
         return
-        
     args = message.text.split()
     if len(args) != 2 or args[1].lower() not in ["on", "off"]:
         status_msg = await message.reply("Usage: /username on|off")
         asyncio.create_task(auto_delete(status_msg, 10))
         return
-        
-    settings = get_group_settings(message.chat.id)
-    settings["username"] = args[1].lower() == "on"
-    
-    status_msg = await message.reply(f"Username deletion set to {'ON ✅' if settings['username'] else 'OFF ❌'}")
+    await set_group_setting(message.chat.id, "username", args[1].lower() == "on")
+    status_msg = await message.reply(f"Username deletion set to {'ON ✅' if args[1].lower() == 'on' else 'OFF ❌'}")
     asyncio.create_task(auto_delete(status_msg, 10))
 
 @dp.message(Command("botlink"))
 async def toggle_botlink(message: types.Message):
-    if message.chat.type == "private": 
+    if message.chat.type == "private":
         return
-        
     if not await is_admin(message.chat.id, message.from_user.id):
         status_msg = await message.reply("❌ Only admins can use this command!")
         asyncio.create_task(auto_delete(status_msg, 10))
         return
-        
     args = message.text.split()
     if len(args) != 2 or args[1].lower() not in ["on", "off"]:
         status_msg = await message.reply("Usage: /botlink on|off")
         asyncio.create_task(auto_delete(status_msg, 10))
         return
-        
-    settings = get_group_settings(message.chat.id)
-    settings["botlink"] = args[1].lower() == "on"
-    
-    status_msg = await message.reply(f"Bot usernames deletion set to {'ON ✅' if settings['botlink'] else 'OFF ❌'}")
+    await set_group_setting(message.chat.id, "botlink", args[1].lower() == "on")
+    status_msg = await message.reply(f"Bot usernames deletion set to {'ON ✅' if args[1].lower() == 'on' else 'OFF ❌'}")
     asyncio.create_task(auto_delete(status_msg, 10))
 
-# --- COMPLETELY FIXED: Whitelist Commands ---
+
+# Whitelist commands
 @dp.message(Command("whitelistadd"))
-async def whitelist_add(message: types.Message):
+async def whitelist_add_cmd(message: types.Message):
     if not await is_admin(message.chat.id, message.from_user.id):
         status_msg = await message.reply("❌ Only admins can use this command!")
         asyncio.create_task(auto_delete(status_msg, 10))
         return
-    
     user_id = None
     user_name = ""
-    
-    # Check if replying to a message
+    username = None
+
     if message.reply_to_message:
         user_id = message.reply_to_message.from_user.id
         user_name = message.reply_to_message.from_user.full_name
-    
-    # Check if user is mentioned in the message
-    elif message.entities:
-        for entity in message.entities:
-            if entity.type == "mention":
-                # Extract username from mention
-                username = message.text[entity.offset+1:entity.offset+entity.length]
-                try:
-                    # Search for user by username in current chat
-                    async for member in bot.get_chat_members(message.chat.id):
-                        if member.user.username and member.user.username.lower() == username.lower():
-                            user_id = member.user.id
-                            user_name = member.user.full_name
-                            break
-                except Exception as e:
-                    continue
-            elif entity.type == "text_mention":
-                # Direct user mention
-                user_id = entity.user.id
-                user_name = entity.user.full_name
-                break
-    
-    # Check if username is provided as argument
-    elif len(message.text.split()) > 1:
-        username_arg = message.text.split()[1].replace('@', '').strip()
-        if username_arg:
-            try:
-                # Try to search user in the current chat
-                async for member in bot.get_chat_members(message.chat.id):
-                    if (member.user.username and member.user.username.lower() == username_arg.lower()) or \
-                       (member.user.full_name and username_arg.lower() in member.user.full_name.lower()):
-                        user_id = member.user.id
-                        user_name = member.user.full_name
-                        break
-                
-                if not user_id:
-                    status_msg = await message.reply(f"❌ User @{username_arg} not found in this group!")
-                    asyncio.create_task(auto_delete(status_msg, 10))
-                    return
-                    
-            except Exception as e:
-                status_msg = await message.reply(f"❌ Error finding user!")
-                asyncio.create_task(auto_delete(status_msg, 10))
-                return
-    
+        username = message.reply_to_message.from_user.username
     else:
-        status_msg = await message.reply("❌ Usage:\n• Reply to user's message\n• Or use: /whitelistadd @username\n• Or mention the user")
+        parts = message.text.split()
+        if len(parts) > 1:
+            maybe = parts[1].strip().lstrip('@')
+            # try to resolve chat member by username in chat (may fail)
+            try:
+                chat_member = await bot.get_chat_member(message.chat.id, maybe)
+                user_id = chat_member.user.id
+                user_name = chat_member.user.full_name
+                username = chat_member.user.username
+            except:
+                # fallback: try convert to int ID
+                try:
+                    user_id = int(maybe)
+                    u = await bot.get_chat(user_id)
+                    user_name = u.full_name
+                    username = u.username
+                except Exception as e:
+                    pass
+
+    if not user_id:
+        status_msg = await message.reply("❌ Usage: Reply to user or /whitelistadd @username or /whitelistadd <id>")
         asyncio.create_task(auto_delete(status_msg, 10))
         return
-    
-    if user_id:
-        whitelist.add(user_id)
-        status_msg = await message.reply(f"✅ {user_name} (ID: {user_id}) whitelisted successfully!")
-        asyncio.create_task(auto_delete(status_msg, 10))
+
+    await whitelist_add(user_id, full_name=user_name, username=username)
+    status_msg = await message.reply(f"✅ {user_name} (ID: {user_id}) whitelisted successfully!")
+    asyncio.create_task(auto_delete(status_msg, 10))
 
 @dp.message(Command("whitelistremove"))
-async def whitelist_remove(message: types.Message):
+async def whitelist_remove_cmd(message: types.Message):
     if not await is_admin(message.chat.id, message.from_user.id):
         status_msg = await message.reply("❌ Only admins can use this command!")
         asyncio.create_task(auto_delete(status_msg, 10))
         return
-    
+
     user_id = None
     user_name = ""
-    
-    # Check if replying to a message
     if message.reply_to_message:
         user_id = message.reply_to_message.from_user.id
         user_name = message.reply_to_message.from_user.full_name
-    
-    # Check if user is mentioned in the message
-    elif message.entities:
-        for entity in message.entities:
-            if entity.type == "mention":
-                # Extract username from mention
-                username = message.text[entity.offset+1:entity.offset+entity.length]
-                # Search in whitelist by username
-                for uid in list(whitelist):
-                    try:
-                        user = await bot.get_chat(uid)
-                        if user.username and user.username.lower() == username.lower():
-                            user_id = uid
-                            user_name = user.full_name
-                            break
-                    except:
-                        continue
-            elif entity.type == "text_mention":
-                # Direct user mention
-                user_id = entity.user.id
-                user_name = entity.user.full_name
-                break
-    
-    # Check if username is provided as argument
-    elif len(message.text.split()) > 1:
-        username_arg = message.text.split()[1].replace('@', '').strip()
-        if username_arg:
-            # Search in whitelist by username or user ID
-            for uid in list(whitelist):
-                try:
-                    user = await bot.get_chat(uid)
-                    if (user.username and user.username.lower() == username_arg.lower()) or \
-                       (user.full_name and username_arg.lower() in user.full_name.lower()) or \
-                       str(uid) == username_arg:
-                        user_id = uid
-                        user_name = user.full_name
-                        break
-                except:
-                    continue
-            
-            if not user_id:
-                status_msg = await message.reply(f"❌ User @{username_arg} not found in whitelist!")
-                asyncio.create_task(auto_delete(status_msg, 10))
-                return
-    
     else:
-        status_msg = await message.reply("❌ Usage:\n• Reply to user's message\n• Or use: /whitelistremove @username\n• Or mention the user")
+        parts = message.text.split()
+        if len(parts) > 1:
+            arg = parts[1].strip().lstrip('@')
+            # try id
+            try:
+                user_id = int(arg)
+                u = await bot.get_chat(user_id)
+                user_name = u.full_name
+            except:
+                doc = await col_whitelist.find_one({"username": arg})
+                if doc:
+                    user_id = doc["_id"]
+                    user_name = doc.get("full_name", "")
+    if not user_id:
+        status_msg = await message.reply("❌ Usage: Reply to user or /whitelistremove @username or /whitelistremove <id>")
         asyncio.create_task(auto_delete(status_msg, 10))
         return
-    
-    if user_id:
-        whitelist.discard(user_id)
-        approved_users.discard(user_id)  # Also remove from approved
-        status_msg = await message.reply(f"❌ {user_name} (ID: {user_id}) removed from whitelist!")
-        asyncio.create_task(auto_delete(status_msg, 10))
+    await whitelist_remove(user_id)
+    await unapprove_user(user_id)
+    status_msg = await message.reply(f"❌ {user_name} (ID: {user_id}) removed from whitelist!")
+    asyncio.create_task(auto_delete(status_msg, 10))
 
 @dp.message(Command("whitelistshow"))
-async def whitelist_show(message: types.Message):
+async def whitelist_show_cmd(message: types.Message):
     if not await is_admin(message.chat.id, message.from_user.id):
         status_msg = await message.reply("❌ Only admins can use this command!")
         asyncio.create_task(auto_delete(status_msg, 10))
         return
-    
-    if not whitelist: 
+    docs = await get_whitelist_list(limit=50)
+    if not docs:
         status_msg = await message.reply("No whitelisted users.")
         asyncio.create_task(auto_delete(status_msg, 10))
         return
-        
-    whitelist_info = "👤 *Whitelisted Users:*\n"
-    for user_id in list(whitelist):
-        try:
-            user = await bot.get_chat(user_id)
-            username = f"@{user.username}" if user.username else "No username"
-            whitelist_info += f"• {user.full_name} ({username}) - ID: `{user_id}`\n"
-        except:
-            whitelist_info += f"• Unknown User (ID: `{user_id}`)\n"
-    
-    status_msg = await message.reply(whitelist_info, parse_mode="Markdown")
+    txt = "👤 *Whitelisted Users:*\n"
+    for d in docs:
+        uname = f"@{d.get('username')}" if d.get('username') else "No username"
+        fname = d.get("full_name", "Unknown")
+        txt += f"• {fname} ({uname}) - ID: `{d['_id']}`\n"
+    status_msg = await message.reply(txt, parse_mode="Markdown")
     asyncio.create_task(auto_delete(status_msg, 15))
 
-# --- Owner Commands ---
+
+# Owner commands
 @dp.message(Command("botstats"))
 async def bot_stats(message: types.Message):
     if not is_owner(message.from_user.id):
         return
-    
+    groups_count = await col_groups.count_documents({})
+    whitelist_count = await col_whitelist.count_documents({})
+    approved_count = await col_approved.count_documents({})
+    warnings_total_cursor = col_warnings.aggregate([{"$group": {"_id": None, "sum": {"$sum": "$count"}}}])
+    warnings_total = 0
+    async for doc in warnings_total_cursor:
+        warnings_total = doc.get("sum", 0)
     stats_text = (
         f"🤖 **Bot Statistics**\n\n"
-        f"📊 Total Groups: {len(group_settings)}\n"
-        f"👤 Whitelisted Users: {len(whitelist)}\n"
-        f"✅ Approved Users: {len(approved_users)}\n"
-        f"⚠️ Total Warnings: {sum(warnings.values())}\n"
+        f"📊 Total Groups: {groups_count}\n"
+        f"👤 Whitelisted Users: {whitelist_count}\n"
+        f"✅ Approved Users: {approved_count}\n"
+        f"⚠️ Total Warnings: {warnings_total}\n"
         f"🕒 Start Time: {time.strftime('%Y-%m-%d %H:%M:%S')}"
     )
-    
     await message.reply(stats_text)
+
 
 @dp.message(Command("listgroups"))
 async def list_groups(message: types.Message):
     if not is_owner(message.from_user.id):
         return
-    
-    if not group_settings:
-        await message.reply("❌ No groups data available.")
-        return
-    
+    cursor = col_groups.find().limit(15)
     groups_list = []
-    for chat_id, settings in list(group_settings.items())[:15]:
+    async for doc in cursor:
+        chat_id = doc["_id"]
         try:
             chat = await bot.get_chat(chat_id)
             group_name = chat.title
             groups_list.append(f"• {group_name} (ID: {chat_id})")
         except:
             groups_list.append(f"• Unknown Group (ID: {chat_id})")
-    
+    if not groups_list:
+        await message.reply("❌ No groups data available.")
+        return
     response = "👥 **Groups List (First 15):**\n\n" + "\n".join(groups_list)
     await message.reply(response)
+
 
 @dp.message(Command("whitelist_info"))
 async def whitelist_info(message: types.Message):
     if not is_owner(message.from_user.id):
         return
-    
-    if not whitelist:
+    cursor = col_whitelist.find().limit(20)
+    rows = []
+    async for d in cursor:
+        uname = f"@{d.get('username')}" if d.get('username') else "No username"
+        rows.append(f"• {d.get('full_name','Unknown')} ({uname}) - ID: {d['_id']}")
+    if not rows:
         await message.reply("❌ No whitelisted users.")
         return
-    
-    whitelist_info = []
-    for user_id in list(whitelist)[:20]:
-        try:
-            user = await bot.get_chat(user_id)
-            username = f"@{user.username}" if user.username else "No username"
-            user_info = f"• {user.full_name} ({username}) - ID: {user_id}"
-            whitelist_info.append(user_info)
-        except:
-            whitelist_info.append(f"• Unknown User (ID: {user_id})")
-    
-    response = "👤 **Whitelisted Users (First 20):**\n\n" + "\n".join(whitelist_info)
-    await message.reply(response)
+    await message.reply("👤 **Whitelisted Users (First 20):**\n\n" + "\n".join(rows))
+
 
 @dp.message(Command("groupinfo"))
 async def group_info_owner(message: types.Message):
     if not is_owner(message.from_user.id):
         return
-    
     args = message.text.split()
     if len(args) < 2:
         await message.reply("❌ Usage: /groupinfo <group_id>")
         return
-    
     try:
         chat_id = int(args[1])
         chat = await bot.get_chat(chat_id)
-        
-        settings = group_settings.get(chat_id, {})
-        
+        settings = await get_group_settings(chat_id)
+        members = "Unknown"
         info_text = (
             f"👥 **Group Info:**\n\n"
-            f"• **Name:** {chat.title}\n"
-            f"• **ID:** {chat.id}\n"
-            f"• **Type:** {chat.type}\n"
-            f"• **Members:** {await chat.get_member_count() if hasattr(chat, 'get_member_count') else 'Unknown'}\n\n"
+            f"• **Name:** {getattr(chat, 'title', 'Unknown')}\n"
+            f"• **ID:** {chat_id}\n"
+            f"• **Type:** {getattr(chat, 'type', 'Unknown')}\n"
+            f"• **Members:** {members}\n\n"
             f"⚙️ **Settings:**\n"
             f"• Links: {'✅ ON' if settings.get('links', True) else '❌ OFF'}\n"
             f"• Bio Links: {'✅ ON' if settings.get('biolinks', True) else '❌ OFF'}\n"
             f"• Usernames: {'✅ ON' if settings.get('username', True) else '❌ OFF'}\n"
             f"• Bot Links: {'✅ ON' if settings.get('botlink', True) else '❌ OFF'}\n"
         )
-        
         await message.reply(info_text)
-        
     except Exception as e:
         await message.reply(f"❌ Error: {str(e)}")
 
+
+# Broadcast flow
 @dp.message(Command("broadcast"))
 async def broadcast_message(message: types.Message):
     if not is_owner(message.from_user.id):
         return
-    
     if not message.reply_to_message:
         await message.reply("❌ Reply to a message to broadcast it.")
         return
-    
-    global pending_broadcast
-    pending_broadcast = message.reply_to_message
-    
-    confirm_keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="✅ Confirm", callback_data="broadcast_confirm"),
-                InlineKeyboardButton(text="❌ Cancel", callback_data="broadcast_cancel")
-            ]
-        ]
-    )
-    
-    await message.reply(
-        "⚠️ **Broadcast Confirmation**\n\n"
-        f"This will send the message to all {len(group_settings)} groups. Continue?",
-        reply_markup=confirm_keyboard
-    )
+    pending = {
+        "chat_id": message.reply_to_message.chat.id,
+        "message_id": message.reply_to_message.message_id
+    }
+    await set_meta("pending_broadcast", pending)
+    confirm_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Confirm", callback_data="broadcast_confirm"),
+         InlineKeyboardButton(text="❌ Cancel", callback_data="broadcast_cancel")]
+    ])
+    await message.reply(f"⚠️ **Broadcast Confirmation**\n\nThis will send the message to all {await col_groups.count_documents({})} groups. Continue?", reply_markup=confirm_keyboard)
+
 
 @dp.callback_query(F.data == "broadcast_confirm")
 async def confirm_broadcast(callback: types.CallbackQuery):
     if not is_owner(callback.from_user.id):
         return
-    
-    global pending_broadcast
-    if not pending_broadcast:
+    pending = await get_meta("pending_broadcast", None)
+    if not pending:
         await callback.answer("No pending broadcast.")
         return
-    
     await callback.message.edit_text("📤 Broadcasting started...")
-    
     success = 0
     failed = 0
-    
-    for chat_id in group_settings.keys():
+    async for doc in col_groups.find():
+        chat_id = doc["_id"]
         try:
-            await bot.copy_message(
-                chat_id=chat_id,
-                from_chat_id=pending_broadcast.chat.id,
-                message_id=pending_broadcast.message_id
-            )
+            await bot.copy_message(chat_id=chat_id, from_chat_id=pending["chat_id"], message_id=pending["message_id"])
             success += 1
-            await asyncio.sleep(0.5)  # Rate limiting
+            await asyncio.sleep(0.4)
         except Exception as e:
             print(f"Broadcast failed to {chat_id}: {e}")
             failed += 1
-    
-    await callback.message.edit_text(
-        f"📊 **Broadcast Complete**\n\n"
-        f"✅ Success: {success}\n"
-        f"❌ Failed: {failed}\n"
-        f"📋 Total: {success + failed}"
-    )
-    
-    pending_broadcast = None
+    await callback.message.edit_text(f"📊 **Broadcast Complete**\n\n✅ Success: {success}\n❌ Failed: {failed}\n📋 Total: {success+failed}")
+    await set_meta("pending_broadcast", None)
 
 @dp.callback_query(F.data == "broadcast_cancel")
 async def cancel_broadcast(callback: types.CallbackQuery):
     if not is_owner(callback.from_user.id):
         return
-    
-    global pending_broadcast
-    pending_broadcast = None
+    await set_meta("pending_broadcast", None)
     await callback.message.edit_text("❌ Broadcast cancelled.")
+
 
 @dp.message(Command("restart"))
 async def restart_bot(message: types.Message):
     if not is_owner(message.from_user.id):
         return
-    
     await message.reply("🔄 Restarting bot...")
-    os.execl(sys.executable, sys.executable, *sys.argv)
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
 
 @dp.message(Command("maintenance"))
 async def maintenance_mode(message: types.Message):
     if not is_owner(message.from_user.id):
         return
-    
     args = message.text.split()
     if len(args) != 2 or args[1].lower() not in ["on", "off"]:
         await message.reply("Usage: /maintenance on|off")
         return
-    
-    global maintenance_active
-    maintenance_active = args[1].lower() == "on"
-    
-    status = "🟢 ACTIVATED" if maintenance_active else "🔴 DEACTIVATED"
+    active = args[1].lower() == "on"
+    await set_meta("maintenance_active", active)
+    status = "🟢 ACTIVATED" if active else "🔴 DEACTIVATED"
     await message.reply(f"🔧 Maintenance mode: {status}")
 
-# --- Button Management Commands ---
+
+# Button management
 @dp.message(Command("setbuttons"))
 async def set_buttons(message: types.Message):
     if not is_owner(message.from_user.id):
         return
-    
     try:
-        # Parse button configuration from message
-        # Format: "text1 - url1 | text2 - url2 | text3 - callback_data3"
         args = message.text.split(maxsplit=1)
         if len(args) < 2:
             await message.reply("Usage: /setbuttons text - url | text - callback_data")
             return
-        
         buttons_config = args[1].split('|')
         new_buttons = []
-        
         for btn_config in buttons_config:
             btn_config = btn_config.strip()
             if '-' in btn_config:
                 text, data = btn_config.split('-', 1)
                 text = text.strip()
                 data = data.strip()
-                
                 if data.startswith(('http://', 'https://', 't.me/')):
                     new_buttons.append({"text": text, "url": data})
                 else:
                     new_buttons.append({"text": text, "callback_data": data})
-        
         if new_buttons:
-            global dynamic_buttons
-            dynamic_buttons = new_buttons
+            await set_dynamic_buttons(new_buttons)
             await message.reply("✅ Buttons updated successfully!")
         else:
             await message.reply("❌ No valid buttons found.")
-            
     except Exception as e:
         await message.reply(f"❌ Error: {str(e)}")
 
@@ -882,33 +671,23 @@ async def set_buttons(message: types.Message):
 async def preview_buttons(message: types.Message):
     if not is_owner(message.from_user.id):
         return
-    
-    buttons_info = "\n".join([
-        f"• {btn['text']} -> {btn.get('url', btn.get('callback_data', 'No data'))}"
-        for btn in dynamic_buttons
-    ])
-    
-    await message.reply(
-        f"🔘 **Current Buttons:**\n\n{buttons_info}\n\n"
-        f"Total: {len(dynamic_buttons)} buttons",
-        reply_markup=await get_personal_buttons()
-    )
+    buttons = await get_dynamic_buttons()
+    buttons_info = "\n".join([f"• {btn['text']} -> {btn.get('url', btn.get('callback_data', 'No data'))}" for btn in buttons])
+    await message.reply(f"🔘 **Current Buttons:**\n\n{buttons_info}\n\nTotal: {len(buttons)} buttons", reply_markup=await get_personal_buttons())
 
 @dp.message(Command("resetbuttons"))
 async def reset_buttons(message: types.Message):
     if not is_owner(message.from_user.id):
         return
-    
-    global dynamic_buttons
-    dynamic_buttons = [
+    default = [
         {"text": "👑 Owner", "url": f"https://t.me/{OWNER_USERNAME}"},
         {"text": "📢 Updates", "url": f"https://t.me/{UPDATES_USERNAME}"},
         {"text": "❓ Help & Commands", "callback_data": "help"}
     ]
-    
+    await set_dynamic_buttons(default)
     await message.reply("✅ Buttons reset to default!")
 
-# --- FIXED HELP CALLBACK WITH PHOTO SUPPORT ---
+
 @dp.callback_query(F.data == "help")
 async def help_callback(callback: types.CallbackQuery):
     try:
@@ -916,83 +695,37 @@ async def help_callback(callback: types.CallbackQuery):
             help_text = f"{BASIC_HELP_TEXT}\n\n{ADMIN_HELP_TEXT}\n\n{OWNER_HELP_TEXT}"
         else:
             help_text = f"{BASIC_HELP_TEXT}\n\n{ADMIN_HELP_TEXT}"
-        
-        # Always delete current message and send new text message
         try:
             await callback.message.delete()
         except:
             pass
-        
-        await bot.send_message(
-            chat_id=callback.from_user.id,
-            text=help_text,
-            reply_markup=help_keyboard,
-            parse_mode="Markdown"
-        )
-        
+        await bot.send_message(chat_id=callback.from_user.id, text=help_text, reply_markup=help_keyboard, parse_mode="Markdown")
         await callback.answer("Help menu opened!")
-        
     except Exception as e:
         print(f"Error in help callback: {e}")
         await callback.answer("❌ Error!")
 
-# --- FIXED BACK TO MAIN WITH PHOTO SUPPORT ---
 @dp.callback_query(F.data == "back_to_main")
 async def back_to_main(callback: types.CallbackQuery):
     try:
         user_name = callback.from_user.first_name
-        
-        # Delete current message
         try:
             await callback.message.delete()
         except:
             pass
-        
-        # Send photo message with main menu (same as /start)
         photo_url = "https://cftc-15g.pages.dev/1758448580525_file_1758448580525.jpg"
-        
         try:
-            await bot.send_photo(
-                chat_id=callback.from_user.id,
-                photo=photo_url,
-                caption=f"Hey 👋🏻 {user_name}\n\n"
-                        "Welcome to Links Shield Bot\n\n"
-                        "I protect your group from:\n"
-                        "➤ All spam Links & URLs\n"
-                        "➤ Username (@example)\n"
-                        "➤ Bot Usernames (@bot)\n" 
-                        "➤ Bio Links also\n"
-                        "➤ Admin Links too\n\n"
-                        "Admins: Use /approveme to send links\n\n"
-                        "Add me to your group & make me admin!",
-                parse_mode="Markdown",
-                reply_markup=await get_personal_buttons()
-            )
-        except Exception as e:
-            # If photo fails, send text message
-            await bot.send_message(
-                chat_id=callback.from_user.id,
-                text=f"Hey 👋🏻 {user_name}\n\n"
-                     "Welcome to Links Shield Bot\n\n"
-                     "I protect your group from:\n"
-                     "➤ All spam Links & URLs\n"
-                     "➤ Username (@example)\n"
-                     "➤ Bot Usernames (@bot)\n" 
-                     "➤ Bio Links also\n"
-                     "➤ Admin Links too\n\n"
-                     "Admins: Use /approveme to send links\n\n"
-                     "Add me to your group & make me admin!",
-                parse_mode="Markdown",
-                reply_markup=await get_personal_buttons()
-            )
-        
+            await bot.send_photo(chat_id=callback.from_user.id, photo=photo_url,
+                                 caption=f"Hey 👋🏻 {user_name}\n\nWelcome to Links Shield Bot\n\nI protect your group from spam & links.\n\nAdmins: Use /approveme to send links\n\nAdd me to your group & make me admin!",
+                                 parse_mode="Markdown", reply_markup=await get_personal_buttons())
+        except Exception:
+            await bot.send_message(chat_id=callback.from_user.id, text=f"Hey 👋🏻 {user_name}\n\nWelcome to Links Shield Bot",
+                                   reply_markup=await get_personal_buttons())
         await callback.answer("Back to main menu!")
-            
     except Exception as e:
         print(f"Error in back_to_main: {e}")
         await callback.answer("❌ Error!")
 
-# --- FIXED CLOSE HELP ---  
 @dp.callback_query(F.data == "close_help")
 async def close_help(callback: types.CallbackQuery):
     try:
@@ -1001,99 +734,140 @@ async def close_help(callback: types.CallbackQuery):
     except Exception as e:
         await callback.answer("✅ Closed")
 
+
 @dp.callback_query(F.data.startswith("unmute:"))
 async def unmute_user(callback: types.CallbackQuery):
     if not await is_admin(callback.message.chat.id, callback.from_user.id):
         await callback.answer("❌ Only admins can unmute!")
         return
-    
     user_id = int(callback.data.split(":")[1])
-    
     try:
-        await bot.restrict_chat_member(
-            callback.message.chat.id,
-            user_id,
-            permissions=types.ChatPermissions(can_send_messages=True)
-        )
-        
+        await bot.restrict_chat_member(callback.message.chat.id, user_id, permissions=types.ChatPermissions(can_send_messages=True))
         await callback.message.edit_text(f"✅ User unmuted successfully!")
         await asyncio.sleep(3)
         await callback.message.delete()
-        
     except Exception as e:
         await callback.answer(f"❌ Unmute failed: {e}")
 
-# --- UPDATED: Message Filtering with Specific Violation Types ---
+
+async def delete_admin_message(message: types.Message):
+    try:
+        await message.delete()
+    except TelegramBadRequest as e:
+        print(f"Delete failed: {e}")
+        return
+    buttons = await get_dynamic_buttons()
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=b["text"], url=b["url"])] for b in buttons if "url" in b][:2])
+    deletion_msg = await message.answer(
+        f"🗑️ Admin @{message.from_user.username or message.from_user.first_name}, your link was deleted. Please approve yourself first using /approveme",
+        reply_markup=kb
+    )
+    asyncio.create_task(auto_delete(deletion_msg))
+
+
+async def warn_and_delete(message: types.Message, violation_type: str = "links"):
+    try:
+        is_user_admin = await is_admin(message.chat.id, message.from_user.id)
+        if is_user_admin:
+            await delete_admin_message(message)
+            return
+        if await is_whitelisted(message.from_user.id) or await is_approved(message.from_user.id):
+            return
+        user_id = message.from_user.id
+        warnings_count = await inc_warning(user_id)
+        try:
+            await message.delete()
+        except TelegramBadRequest as e:
+            print(f"Delete failed: {e}")
+            return
+        name = message.from_user.username or message.from_user.first_name
+        if violation_type == "biolinks":
+            warning_text = f"👤 @{name} Your message was hidden. Bio links are not allowed in this group, please remove them."
+        elif violation_type == "links":
+            warning_text = f"👤 @{name} Your message was hidden. Links are not allowed in this group, please remove them."
+        elif violation_type == "username":
+            warning_text = f"👤 @{name} Your message was hidden. Usernames are not allowed in this group, please remove them."
+        elif violation_type == "botlink":
+            warning_text = f"👤 @{name} Your message was hidden. Bot usernames are not allowed in this group, please remove them."
+        else:
+            warning_text = f"⚠️ @{name} Warning {warnings_count}/3 - Risky content not allowed!"
+        buttons = await get_dynamic_buttons()
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=b["text"], url=b["url"])] for b in buttons if "url" in b][:2])
+        warning_msg = await message.answer(warning_text, reply_markup=kb)
+        asyncio.create_task(auto_delete(warning_msg))
+        try:
+            await bot.send_message(LOG_CHAT_ID, f"⚠️ @{name} sent {violation_type} in {message.chat.title}")
+        except Exception as e:
+            print(f"Log failed: {e}")
+        if warnings_count >= 3:
+            until_date = int(time.time()) + MUTE_DURATION_MIN * 60
+            try:
+                await bot.restrict_chat_member(message.chat.id, user_id, permissions=types.ChatPermissions(can_send_messages=False), until_date=until_date)
+                mute_msg = await bot.send_message(message.chat.id, f"🔇 @{name} muted for {MUTE_DURATION_MIN} min.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Unmute", callback_data=f"unmute:{user_id}")]]))
+                asyncio.create_task(auto_delete(mute_msg))
+                await reset_warnings(user_id)
+                try:
+                    await bot.send_message(LOG_CHAT_ID, f"🔇 @{name} muted in {message.chat.title}")
+                except:
+                    pass
+            except TelegramBadRequest as e:
+                error_msg = await message.reply("❌ I need admin permissions to mute users!")
+                asyncio.create_task(auto_delete(error_msg))
+                print(f"Mute failed: {e}")
+    except Exception as e:
+        print(f"Error in warn_and_delete: {e}")
+
+
 @dp.message(F.text | F.caption)
 async def filter_messages(message: types.Message):
-    if maintenance_active and not is_owner(message.from_user.id):
-        return
-    
-    if message.chat.type not in ["group", "supergroup"]:
-        return
-    
-    # Skip if user is whitelisted or approved
-    if message.from_user.id in whitelist or message.from_user.id in approved_users:
-        return
-    
-    settings = get_group_settings(message.chat.id)
-    text = message.text or message.caption or ""
-    
-    # Debug logging with user info
-    print(f"Checking message from {message.from_user.id} ({message.from_user.username}): {text[:50]}...")
-    
-    # Check for links first
-    if settings["links"] and has_links(text):
-        print(f"Detected links in message from {message.from_user.id}")
-        await warn_and_delete(message, "links")
-        return
-    
-    # Check for bot usernames
-    if settings["botlink"] and has_bot_username(text):
-        print(f"Detected bot username in message from {message.from_user.id}")
-        await warn_and_delete(message, "botlink")
-        return
-    
-    # Check for regular usernames
-    if settings["username"] and has_username(text):
-        print(f"Detected username in message from {message.from_user.id}")
-        await warn_and_delete(message, "username")
-        return
-    
-    # Check bio links (only if other checks passed)
-    if settings["biolinks"]:
-        print(f"Checking bio for user {message.from_user.id}...")
-        has_bio_links = await check_user_bio(message.from_user.id)
-        if has_bio_links:
-            print(f"Detected bio links for user {message.from_user.id}")
-            await warn_and_delete(message, "biolinks")
+    try:
+        maintenance_active = await get_meta("maintenance_active", False)
+        if maintenance_active and not is_owner(message.from_user.id):
             return
-    
-    print(f"Message from {message.from_user.id} passed all checks")
+        if message.chat.type not in ["group", "supergroup"]:
+            return
+        if await is_whitelisted(message.from_user.id) or await is_approved(message.from_user.id):
+            return
+        settings = await get_group_settings(message.chat.id)
+        text = message.text or message.caption or ""
+        print(f"Checking message from {message.from_user.id} ({message.from_user.username}): {text[:50]}...")
+        if settings.get("links", True) and has_links(text):
+            await warn_and_delete(message, "links")
+            return
+        if settings.get("botlink", True) and has_bot_username(text):
+            await warn_and_delete(message, "botlink")
+            return
+        if settings.get("username", True) and has_username(text):
+            await warn_and_delete(message, "username")
+            return
+        if settings.get("biolinks", True):
+            has_bio_links = await check_user_bio(message.from_user.id)
+            if has_bio_links:
+                await warn_and_delete(message, "biolinks")
+                return
+        print(f"Message from {message.from_user.id} passed all checks")
+    except Exception as e:
+        print(f"Error in filter_messages: {e}")
 
-# --- Error Handler ---
+
 @dp.errors()
 async def error_handler(update: types.Update, exception: Exception):
     print(f"Update: {update}")
     print(f"Exception type: {type(exception).__name__}")
     print(f"Exception details: {exception}")
-    
-    # Log to your log chat if it's a critical error
     if "critical" in str(exception).lower() or "forbidden" in str(exception).lower():
         try:
-            await bot.send_message(
-                LOG_CHAT_ID,
-                f"⚠️ Bot Error: {type(exception).__name__}\n\n{str(exception)[:1000]}"
-            )
+            await bot.send_message(LOG_CHAT_ID, f"⚠️ Bot Error: {type(exception).__name__}\n\n{str(exception)[:1000]}")
         except:
             pass
-            
     return True
 
-# --- Main Function ---
+
+# === Main run ===
 async def main():
-    print("🤖 Bot is starting...")
+    print("🤖 Bot starting (MongoDB integrated)...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
+    import sys
     asyncio.run(main())
