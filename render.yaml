@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: links-shield-bot
+    env: python
+    plan: free
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python bot.py"
+    envVars:
+      - key: BOT_TOKEN
+        value: "8470214636:AAExm5uh4tu621S5zvHDMDfWQzxruvgvuwY"
+      - key: BOT_OWNER_ID
+        value: "6156257558"
+      - key: OWNER_USERNAME
+        value: "Insaanova"
+      - key: UPDATES_USERNAME
+        value: "FRIENDS_CORNER_CHATTING_GROUP"
+      - key: LOG_CHAT_ID
+        value: "-1003086724642"
+      - key: BROADCAST_SOURCE_CHANNEL
+        value: "-1002933746046"
